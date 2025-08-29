@@ -1,0 +1,31 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/main.py", line 88, in <module>
+    main()
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/main.py", line 72, in main
+    run_experiment1_strict(cfg, IMG_DIR)
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/train.py", line 634, in run_experiment1_strict
+    fq.train_task(t, task_train_loaders[t], task_val_loaders[t])
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/train.py", line 487, in train_task
+    z = self.F0(xb)
+        ^^^^^^^^^^^
+  File "/home/runner/work/_tool/Python/3.11.13/x64/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/_tool/Python/3.11.13/x64/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/train.py", line 117, in forward
+    z = self.tap(x)  # d-dim
+        ^^^^^^^^^^^
+  File "/home/runner/work/_tool/Python/3.11.13/x64/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/_tool/Python/3.11.13/x64/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/_tool/Python/3.11.13/x64/lib/python3.11/site-packages/torch/nn/modules/linear.py", line 125, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: mat1 and mat2 shapes cannot be multiplied (32x64 and 512x64)
