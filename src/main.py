@@ -5,7 +5,7 @@ Run from project root with:
     python -m src.main
 
 It will execute a quick functionality test by default (FakeData, few steps)
-and save figures into .research/iteration1/images.
+and save figures into .research/iteration3/images.
 
 Use --config config/config.yaml to customize.
 """
@@ -23,7 +23,7 @@ from .train import (
 )
 
 
-IMG_DIR = os.path.join('.research', 'iteration2', 'images')
+IMG_DIR = os.path.join('.research', 'iteration3', 'images')
 os.makedirs(IMG_DIR, exist_ok=True)
 
 

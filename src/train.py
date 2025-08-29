@@ -179,22 +179,34 @@ class ProductQuantizerTorch:
         self.initialized = False
 
     def _init_kmeans(self, Z: torch.Tensor, iters: int = 5):
-        """Initialize centroids with a few iterations of k-means per subspace (mini-batch)."""
+        """Initialize centroids with a few iterations of k-means per subspace (mini-batch).
+        Robust to N < K by sampling with replacement and operating on centroid device.
+        """
         assert Z.shape[1] == self.d
         N = Z.shape[0]
         Zs = Z.reshape(N, self.M, self.d_sub)
+        dev = self.centroids.device
         with torch.no_grad():
             for m in range(self.M):
-                X = Zs[:, m, :]
-                idx = torch.randperm(N)[:self.K]
+                X = Zs[:, m, :].to(dev)
+                # Sample initial centroids (with replacement if N < K)
+                if N >= self.K:
+                    idx = torch.randperm(N, device=dev)[:self.K]
+                else:
+                    idx = torch.randint(0, N, (self.K,), device=dev)
                 C = X[idx].clone().contiguous()
                 for _ in range(iters):
+                    # (N, K)
                     dist = torch.cdist(X, C, p=2)
                     a = dist.argmin(dim=1)
                     for k in range(self.K):
                         mask = (a == k)
                         if mask.any():
                             C[k] = X[mask].mean(dim=0)
+                        else:
+                            # Re-seed empty centroid to a random point
+                            ridx = torch.randint(0, N, (1,), device=dev)
+                            C[k] = X[ridx]
                 self.centroids[m] = C
                 self.counts[m] = 1
         self.initialized = True
@@ -206,17 +218,18 @@ class ProductQuantizerTorch:
         N = Z.shape[0]
         Zs = Z.reshape(N, self.M, self.d_sub)
         codes = []
+        dev = self.centroids.device
         for m in range(self.M):
-            X = Zs[:, m, :]
+            X = Zs[:, m, :].to(dev)
             C = self.centroids[m]
             dist = torch.cdist(X, C, p=2)
             a = dist.argmin(dim=1)
-            codes.append(a)
+            codes.append(a.cpu())
         codes = torch.stack(codes, dim=1)  # (N, M)
         if self.K <= 256:
-            return codes.to(torch.uint8).cpu()
+            return codes.to(torch.uint8)
         else:
-            return codes.to(torch.int16).cpu()
+            return codes.to(torch.int16)
 
     @torch.no_grad()
     def decode(self, codes: torch.Tensor, device: Optional[str] = None) -> torch.Tensor:
