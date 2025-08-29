@@ -23,7 +23,7 @@ from .train import (
 )
 
 
-IMG_DIR = os.path.join('.research', 'iteration1', 'images')
+IMG_DIR = os.path.join('.research', 'iteration2', 'images')
 os.makedirs(IMG_DIR, exist_ok=True)
 
 

@@ -94,7 +94,6 @@ class F0Backbone(nn.Module):
         self.layer3 = base.layer3
         self.layer4 = base.layer4
         self.avgpool = base.avgpool
-        self._feature_dim = 512
         self.freeze_depth = freeze_depth
         # Use up to layer{freeze_depth}
         self.used_layers = []
@@ -104,6 +103,16 @@ class F0Backbone(nn.Module):
         if freeze_depth >= 2: self.used_layers.append('layer2')
         if freeze_depth >= 3: self.used_layers.append('layer3')
         if freeze_depth >= 4: self.used_layers.append('layer4')
+        # Determine feature dim based on deepest used layer
+        if freeze_depth >= 4:
+            self._feature_dim = 512
+        elif freeze_depth >= 3:
+            self._feature_dim = 256
+        elif freeze_depth >= 2:
+            self._feature_dim = 128
+        else:
+            # up to (and including) layer1 or only stem
+            self._feature_dim = 64
         self.tap = nn.Linear(self._feature_dim, d)
 
     def forward(self, x):
@@ -482,6 +491,7 @@ class FrequentTrainer:
             for xb, yb in train_loader:
                 xb = xb.to(self.device)
                 yb = yb.to(self.device)
+                did_replay = False
                 # Online forward
                 with torch.no_grad():
                     z = self.F0(xb)
@@ -495,6 +505,7 @@ class FrequentTrainer:
                     logits_mem = self.F1(self.H(z_mem))
                     loss_mem = self.criterion(logits_mem, y_mem.to(self.device))
                     loss = loss + loss_mem
+                    did_replay = True
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
@@ -503,7 +514,7 @@ class FrequentTrainer:
                 # EMA update
                 self._update_ema(decay=0.99)
                 # ReLo update
-                if self.buffer.size() > 0 and 'loss_mem' in locals():
+                if self.buffer.size() > 0 and did_replay:
                     with torch.no_grad():
                         per_sample_cur = F.cross_entropy(logits_mem, y_mem.to(self.device), reduction='none')
                         logits_tar = self.F1_ema(self.H_ema(z_mem))
