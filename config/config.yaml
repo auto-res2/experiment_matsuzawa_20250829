@@ -1,0 +1,35 @@
+# Quick CI-style configuration for FREQUENT experiments
+# Runs on FakeData for speed and saves figures as PDFs under .research/iteration1/images
+
+device: auto         # auto -> use CUDA if available (e.g., Tesla T4), else CPU
+
+# Model / PQ
+d: 64
+M: 4
+K: 256
+freeze_depth: 1
+
+# Optimization
+lr: 0.05
+momentum: 0.9
+weight_decay: 1.0e-4
+batch_size: 32
+epochs_per_task: 1
+patience: 1
+
+# Budgets
+replay_ratio_target_budget: 0.5
+mem_kb_list: [200]
+
+# Tasking / Data
+n_tasks: 2
+classes_per_task: 5
+use_fake_data: true
+subset_per_class: 60
+dataset_name: CIFAR100
+num_workers: 0
+
+data_patterns: [standard, tinted]
+
+# Seeds
+seed_list: [123]
