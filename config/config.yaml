@@ -1,4 +1,4 @@
-# Default experiment configuration for FREQUENT (iteration 4)
+# Default experiment configuration for FREQUENT (iteration 5)
 exp_name: frequent_iter4_quick
 dataset_root: data
 seeds: [0]
@@ -11,4 +11,4 @@ classes_per_task: 5
 batch_size: 32
 quick_test: true
 num_workers: 2
-save_dir_images: .research/iteration4/images
+save_dir_images: .research/iteration5/images

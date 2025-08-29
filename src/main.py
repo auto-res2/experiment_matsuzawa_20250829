@@ -14,13 +14,37 @@ from .evaluate import confusion_matrix, save_confusion_matrix_pdf
 
 
 def main():
-    # Load config
-    cfg_path = os.environ.get('CL_CONFIG', 'config/default.yaml')
-    if not os.path.exists(cfg_path):
-        print(f"Config file not found at {cfg_path}. Please create it.")
-        sys.exit(1)
-    with open(cfg_path, 'r') as f:
-        cfg = yaml.safe_load(f)
+    # Load config with robust fallback
+    env_cfg = os.environ.get('CL_CONFIG')
+    cfg_path = None
+    if env_cfg and os.path.exists(env_cfg):
+        cfg_path = env_cfg
+    else:
+        for cand in ('config/default.yaml', 'config/config.yaml'):
+            if os.path.exists(cand):
+                cfg_path = cand
+                break
+
+    if cfg_path is None:
+        print("Config file not found at config/default.yaml or config/config.yaml. Using internal defaults.")
+        cfg = {
+            'exp_name': 'iteration4_frequent',
+            'dataset_root': 'data',
+            'seeds': [0],
+            'budgets': ['50kB'],
+            'compute_alphas': [0.5],
+            'methods': ['FREQUENT', 'ER'],
+            'epochs_per_task': 1,
+            'tasks': 2,
+            'classes_per_task': 5,
+            'batch_size': 32,
+            'quick_test': True,
+            'num_workers': 2,
+            'save_dir_images': '.research/iteration5/images',
+        }
+    else:
+        with open(cfg_path, 'r') as f:
+            cfg = yaml.safe_load(f)
 
     exp_name = cfg.get('exp_name', 'iteration4_frequent')
     dataset_root = cfg.get('dataset_root', 'data')
@@ -34,7 +58,8 @@ def main():
     batch_size = int(cfg.get('batch_size', 32))
     quick_test = bool(cfg.get('quick_test', True))
     num_workers = int(cfg.get('num_workers', 2))
-    image_dir = cfg.get('save_dir_images', '.research/iteration4/images')
+    # Ensure all experiment images go to iteration5 directory by default
+    image_dir = cfg.get('save_dir_images', '.research/iteration5/images')
 
     os.makedirs(image_dir, exist_ok=True)
 
