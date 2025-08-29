@@ -1,8 +1,8 @@
-torch
-torchvision
-numpy
-matplotlib
-seaborn
-pandas
-pynvml
-pyyaml
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.22
+scipy>=1.10
+matplotlib>=3.7
+seaborn>=0.12
+tqdm>=4.64
+PyYAML>=6.0
