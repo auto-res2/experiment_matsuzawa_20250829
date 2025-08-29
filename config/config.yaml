@@ -1,33 +1,36 @@
-# Minimal configuration for a quick smoke test that runs under a minute on CPU/GPU.
-mode: smoke
-save_dir: .research/iteration2/images
-
-# Data/task stream
-dataset_name: fake  # use 'cifar100' for real runs
-num_tasks: 2
-classes_per_task: 5
-limit_per_class: 50
-seed: 42
-# device: cuda  # optional; auto-selects if available
-
-# Training configs
-train_config_propqem:
+# Default configuration for ProPqEM toy experiments
+train_config:
+  f_dim: 256
+  z_dim: 64
+  M: 8
+  d_sub: 8
+  K: 256
+  pq_alpha: 0.05
+  pq_tau: 0.07
+  mse_growth_thr: 0.1
+  rho: 8
   lr: 0.05
-  weight_decay: 0.0005
+  wd: 0.0005
   momentum: 0.9
-  epochs_per_task: 1
-  warmup_epochs_first_task: 1
-  freeze_after_warmup: true
-  tau_recon: 0.2
-  rho_gis: 1.0
-  replay_K: 16
-  budget_C: 80
+  batch_size: 32
+  epochs_warmup_task1: 1
+  C_backprops_per_task: 40
+  replay_K: 32
+  replay_sampler: class
+  lam_l2: 1.0
+  lam_cos: 0.2
   mem_cap_mb: 1.0
+  no_gis: false
+  no_curriculum: false
+  no_f_space_loss: false
 
-train_config_baseline:
-  lr: 0.05
-  weight_decay: 0.0005
-  momentum: 0.9
-  epochs_per_task: 1
-  replay_K: 16
-  mem_cap_mb: 1.0
+exp1:
+  num_tasks: 3
+  classes_per_task: 3
+  seeds: [11, 22]
+
+exp2:
+  seeds: [33, 44]
+
+exp3:
+  seeds: [55, 66]

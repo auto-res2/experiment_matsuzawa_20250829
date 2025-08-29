@@ -1,679 +1,644 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Training utilities and core ProPqEM implementation.
-Run from project root with: python -m src.main
-All plots saved as high-quality PDFs under .research/iteration2/images by default.
-"""
-import os
-import math
-import time
-import random
-from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional
+Training components for ProPqEM and baselines.
+Includes:
+- TinyBackbone -> f (256D)
+- ResidualEncoder -> z (64D)
+- DeltaDecoder: z -> f
+- ClassifierHead
+- ProductQuantizer with multi-generation support
+- EpisodicMemory with GIS-like selection
+- ProPqEMLearner and ERFeatureLearner training loops (evaluation done in evaluate.py)
 
+Notes:
+- All modules use lightweight operations suitable for NVIDIA T4 (16GB) and quick smoke tests.
+- Memory accounting and PDF figure saving handled in src.main.
+"""
+
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import seaborn as sns
+from torch.utils.data import DataLoader
 
-from .evaluate import evaluate, compute_confusion_matrix, compute_forgetting
-
-# ------------------------------
-# Utilities & Reproducibility
-# ------------------------------
-
-def set_seed(seed: int = 2025):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+# Optional FLOPs counter
+try:
+    from fvcore.nn import FlopCountAnalysis  # type: ignore
+    _FLOPS_OK = True
+except Exception:
+    _FLOPS_OK = False
 
 
-def to_device(x, device):
-    if isinstance(x, (list, tuple)):
-        return [to_device(xx, device) for xx in x]
-    return x.to(device)
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def cosine_sim(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    a_n = a / (a.norm(dim=-1, keepdim=True) + eps)
+    b_n = b / (b.norm(dim=-1, keepdim=True) + eps)
+    return (a_n * b_n).sum(dim=-1)
 
 
-def count_bytes_tensor(t: torch.Tensor) -> int:
-    if t.dtype == torch.uint8:
-        return t.numel()
-    elif t.dtype == torch.float32:
-        return t.numel() * 4
-    elif t.dtype == torch.float16:
-        return t.numel() * 2
-    elif t.dtype == torch.int64:
-        return t.numel() * 8
-    else:
-        return t.element_size() * t.numel()
+# -----------------------------
+# Models
+# -----------------------------
 
-
-def bytes_to_mb(nbytes: int) -> float:
-    return nbytes / (1024.0 * 1024.0)
-
-
-def running_mean(prev_mean, new_val, count):
-    return (prev_mean * (count - 1) + new_val) / max(count, 1)
-
-
-def cosine_error(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    a_n = F.normalize(a, dim=-1)
-    b_n = F.normalize(b, dim=-1)
-    cos = (a_n * b_n).sum(dim=-1)
-    return 1.0 - cos
-
-
-# ------------------------------
-# Model Components
-# ------------------------------
-
-class TinyConvBackbone(nn.Module):
-    """
-    Lightweight CNN backbone producing a 256-D feature f.
-    Split into 4 blocks; we will freeze bottom-3 blocks after warm-up.
-    """
+class TinyBackbone(nn.Module):
     def __init__(self, out_dim=256):
         super().__init__()
-        self.block1 = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
-            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
-            nn.MaxPool2d(2)
+        self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
+        self.pool = nn.MaxPool2d(2)
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 4 * 4, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, out_dim),
         )
-        self.block2 = nn.Sequential(
-            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        self.block3 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
-            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        self.block4 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1,1))
-        )
-        self.proj = nn.Linear(256, out_dim)
+        self.frozen = False
 
-        self.blocks = [self.block1, self.block2, self.block3, self.block4]
-        self.frozen_until = 2  # freeze blocks 0..2 after warm-up
+    def freeze_low(self):
+        for m in [self.conv1, self.conv2, self.conv3]:
+            for p in m.parameters():
+                p.requires_grad = False
+        self.frozen = True
 
-    def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
-        x = x.view(x.size(0), -1)
-        f = self.proj(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.conv1(x))
+        x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        x = F.relu(self.conv3(x))
+        x = self.pool(x)
+        f = self.head(x)
         return f
 
-    def freeze_low_blocks(self):
-        for bi, blk in enumerate(self.blocks[:self.frozen_until+1]):
-            for p in blk.parameters():
-                p.requires_grad = False
 
-
-class ResidualMLP(nn.Module):
-    # 256 -> 128 -> 64 as task-adaptive residual encoder
+class ResidualEncoder(nn.Module):
     def __init__(self, in_dim=256, hidden=128, out_dim=64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.ReLU(inplace=True),
-            nn.Linear(hidden, out_dim)
+            nn.Linear(in_dim, hidden), nn.ReLU(inplace=True), nn.Linear(hidden, out_dim)
         )
 
-    def forward(self, f):
+    def forward(self, f: torch.Tensor) -> torch.Tensor:
         return self.net(f)
 
 
 class DeltaDecoder(nn.Module):
-    # z (64) -> f (256)
-    def __init__(self, in_dim=64, hidden=128, out_dim=256):
+    def __init__(self, in_dim=64, hidden=256, out_dim=256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.ReLU(inplace=True),
-            nn.Linear(hidden, out_dim)
+            nn.Linear(in_dim, hidden), nn.ReLU(inplace=True), nn.Linear(hidden, out_dim)
         )
 
-    def forward(self, z):
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.net(z)
 
 
-class Classifier(nn.Module):
-    def __init__(self, in_dim=256, num_classes=100):
+class ClassifierHead(nn.Module):
+    def __init__(self, in_dim=256, num_classes=10):
         super().__init__()
         self.fc = nn.Linear(in_dim, num_classes)
 
-    def forward(self, f):
+    def forward(self, f: torch.Tensor) -> torch.Tensor:
         return self.fc(f)
 
 
-# ------------------------------
-# Product Quantiser with Generations
-# ------------------------------
+# -----------------------------
+# Product Quantizer (with generations)
+# -----------------------------
 
-class ProductQuantiser(nn.Module):
-    """
-    PQ with M subspaces, Ks codes per subspace, dimension D=64.
-    Manages generations. Each generation contains M codebooks [Ks, ds].
-    """
-    def __init__(self, D=64, M=8, Ks=256, device='cpu'):
-        super().__init__()
-        assert D % M == 0
-        self.D = D
+class ProductQuantizer:
+    def __init__(self, M=8, d_sub=8, K=256, alpha=0.05, tau=0.07, device: str = "cpu"):
         self.M = M
-        self.Ks = Ks
-        self.ds = D // M
-        self.generations: List[List[torch.Tensor]] = []
+        self.d_sub = d_sub
+        self.K = K
+        self.alpha = alpha
+        self.tau = tau
         self.device = device
-        self.add_new_generation(init_means=None)
+        self.generations: List[torch.Tensor] = []  # each: [M, K, d_sub]
+        self.gen_usage: List[List[torch.Tensor]] = []  # per-gen usage counts per subspace [M, K]
+        self.latest_moving_mse = 0.0
+        self.mse_ma_alpha = 0.1
 
-    def add_new_generation(self, init_means: Optional[torch.Tensor]):
-        gen = []
-        if init_means is None:
+        # Optional KMeans
+        try:
+            from sklearn.cluster import MiniBatchKMeans  # type: ignore
+            self._SKLEARN_OK = True
+            self._MiniBatchKMeans = MiniBatchKMeans
+        except Exception:
+            self._SKLEARN_OK = False
+            self._MiniBatchKMeans = None
+
+    @property
+    def z_dim(self) -> int:
+        return self.M * self.d_sub
+
+    def _init_kmeans_sub(self, sketch: np.ndarray) -> torch.Tensor:
+        N = sketch.shape[0]
+        codebooks = []
+        for m in range(self.M):
+            X = sketch[:, m * self.d_sub:(m + 1) * self.d_sub]
+            if self._SKLEARN_OK and N >= self.K:
+                km = self._MiniBatchKMeans(n_clusters=self.K, batch_size=min(1024, N), n_init=1, max_iter=50, verbose=0)
+                km.fit(X)
+                C = km.cluster_centers_.astype(np.float32)
+            else:
+                idx = np.random.choice(N, size=min(self.K, N), replace=False)
+                C = np.zeros((self.K, self.d_sub), dtype=np.float32)
+                C[:len(idx)] = X[idx].astype(np.float32)
+                if len(idx) < self.K:
+                    C[len(idx):] = X[np.random.choice(N, size=self.K - len(idx), replace=True)].astype(np.float32)
+            codebooks.append(torch.from_numpy(C))
+        cb = torch.stack(codebooks, dim=0).to(self.device)  # [M, K, d_sub]
+        return cb
+
+    def warm_start(self, sketch_z: torch.Tensor):
+        sketch_np = sketch_z.detach().cpu().numpy()
+        cb = self._init_kmeans_sub(sketch_np)
+        self.generations = [cb]
+        self.gen_usage = [[torch.zeros(self.K, dtype=torch.long, device=self.device) for _ in range(self.M)]]
+        print(f"[PQ] Warm-started generation-0 codebooks with shape {tuple(cb.shape)}")
+
+    def add_generation(self, sketch_z: torch.Tensor):
+        sketch_np = sketch_z.detach().cpu().numpy()
+        cb = self._init_kmeans_sub(sketch_np)
+        self.generations.append(cb)
+        self.gen_usage.append([torch.zeros(self.K, dtype=torch.long, device=self.device) for _ in range(self.M)])
+        print(f"[PQ] Added new generation {len(self.generations)-1} with codebook shape {tuple(cb.shape)}")
+
+    def _assign_codes_latest(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert len(self.generations) > 0, "PQ not initialised. Call warm_start() first."
+        cb = self.generations[-1]  # [M, K, d_sub]
+        B = z.shape[0]
+        z_sub = z.view(B, self.M, self.d_sub)
+        codes = torch.empty(B, self.M, dtype=torch.long, device=z.device)
+        rec_sub = torch.empty_like(z_sub)
+        for m in range(self.M):
+            C = cb[m]  # [K, d_sub]
+            zs = z_sub[:, m].unsqueeze(1)  # [B,1,d]
+            dist2 = ((zs - C.unsqueeze(0)) ** 2).sum(dim=-1)  # [B, K]
+            idx = torch.argmin(dist2, dim=1)
+            codes[:, m] = idx
+            rec_sub[:, m] = C[idx]
+        rec_z = rec_sub.reshape(B, -1)
+        return codes, rec_z
+
+    def encode(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        codes, rec_z = self._assign_codes_latest(z)
+        gens = torch.full((z.size(0),), len(self.generations) - 1, dtype=torch.long, device=z.device)
+        return codes, rec_z, gens
+
+    def decode(self, codes: torch.Tensor, gens: torch.Tensor) -> torch.Tensor:
+        B, M = codes.shape
+        assert M == self.M
+        z_hat = torch.empty((B, self.z_dim), dtype=torch.float32, device=codes.device)
+        for i in range(B):
+            g = int(gens[i].item())
+            cb = self.generations[g]
+            z_sub = []
             for m in range(self.M):
-                cb = torch.randn(self.Ks, self.ds, device=self.device)
-                cb = F.normalize(cb, dim=-1)
-                gen.append(nn.Parameter(cb))
-        else:
-            with torch.no_grad():
-                init_means = init_means.to(self.device)
-                init_means = init_means.view(-1, self.M, self.ds)
-                for m in range(self.M):
-                    sub = init_means[:, m]
-                    idx = torch.randint(0, sub.size(0), (1,), device=self.device)
-                    centers = [sub[idx].squeeze(0)]
-                    for _ in range(self.Ks - 1):
-                        d2 = torch.cdist(sub, torch.stack(centers)) ** 2
-                        probs = d2.min(dim=1).values + 1e-6
-                        probs = probs / probs.sum()
-                        idx = torch.multinomial(probs, 1)
-                        centers.append(sub[idx].squeeze(0))
-                    cb = torch.stack(centers)
-                    cb = F.normalize(cb, dim=-1)
-                    gen.append(nn.Parameter(cb))
-        for i, cb in enumerate(gen):
-            self.register_parameter(f'gen{len(self.generations)}_cb{i}', cb)
-        self.generations.append(gen)
+                idx = int(codes[i, m].item())
+                z_sub.append(cb[m, idx])
+            z_hat[i] = torch.cat(z_sub, dim=0)
+        return z_hat
 
-    def current_generation_id(self) -> int:
-        return len(self.generations) - 1
-
-    def generation_count(self) -> int:
-        return len(self.generations)
-
-    def encode(self, z: torch.Tensor) -> torch.ByteTensor:
-        gen = self.generations[-1]
-        B = z.size(0)
-        z_parts = z.view(B, self.M, self.ds)
-        codes = []
+    def ema_update_latest(self, z: torch.Tensor, codes: torch.Tensor):
+        assert len(self.generations) > 0
+        cb = self.generations[-1]
+        usage_list = self.gen_usage[-1]
+        B = z.shape[0]
+        z_sub = z.view(B, self.M, self.d_sub)
         for m in range(self.M):
-            cb = gen[m]  # [Ks, ds]
-            d = torch.cdist(z_parts[:, m], cb)
-            idx = torch.argmin(d, dim=1)
-            codes.append(idx.to(torch.uint8))
-        codes = torch.stack(codes, dim=1)
-        return codes
+            idx = codes[:, m]
+            usage_list[m].index_add_(0, idx, torch.ones_like(idx, dtype=torch.long))
+            C = cb[m]
+            unique_idx = idx.unique()
+            for j in unique_idx:
+                mask = (idx == j)
+                if mask.any():
+                    xj = z_sub[mask, m].mean(dim=0)
+                    C[j] = (1.0 - self.alpha) * C[j] + self.alpha * xj
+        with torch.no_grad():
+            _, rec_z = self._assign_codes_latest(z)
+            mse = F.mse_loss(rec_z, z).item()
+            self.latest_moving_mse = (1 - self.mse_ma_alpha) * self.latest_moving_mse + self.mse_ma_alpha * mse
 
-    def decode(self, codes: torch.ByteTensor, gen_id: int) -> torch.Tensor:
-        gen = self.generations[gen_id]
-        B = codes.size(0)
-        parts = []
+    def revive_dead_codes_latest(self, dead_thr: int = 1, z_pool: Optional[torch.Tensor] = None):
+        cb = self.generations[-1]
+        usage_list = self.gen_usage[-1]
+        B = 0 if z_pool is None else z_pool.size(0)
         for m in range(self.M):
-            idx = codes[:, m].long()
-            parts.append(gen[m][idx])
-        z_rec = torch.cat(parts, dim=1)
-        return z_rec
+            usage = usage_list[m]
+            dead = (usage <= dead_thr).nonzero(as_tuple=False).flatten()
+            if len(dead) > 0:
+                if z_pool is not None and B > 0:
+                    repl = z_pool[torch.randint(0, B, (len(dead),)), m * self.d_sub:(m + 1) * self.d_sub]
+                else:
+                    repl = torch.randn(len(dead), self.d_sub, device=cb.device) * 0.01
+                cb[m, dead] = repl
+                usage[dead] = 1
 
-    def decode_mixed_gens(self, codes: torch.ByteTensor, gens: torch.LongTensor) -> torch.Tensor:
-        # Handles batch where each item can come from a different generation
-        if codes.numel() == 0:
-            return torch.empty(0, self.D, device=codes.device)
-        outs = torch.empty(codes.size(0), self.D, device=codes.device)
-        unique_gens = gens.unique()
-        for g in unique_gens:
-            mask = (gens == g)
-            idxs = mask.nonzero(as_tuple=False).view(-1)
-            z_g = self.decode(codes[idxs], int(g.item()))
-            outs[idxs] = z_g
-        return outs
-
-    def recon_error(self, z: torch.Tensor) -> torch.Tensor:
-        codes = self.encode(z)
-        z_rec = self.decode(codes, self.current_generation_id())
-        return cosine_error(z, z_rec).mean()
-
-    def bytes_for_codebooks(self) -> int:
-        total = 0
-        for gen in self.generations:
-            for cb in gen:
-                total += count_bytes_tensor(cb.data)
-        return total
-
-
-# ------------------------------
-# GIS Selector
-# ------------------------------
-
-class GISState:
-    def __init__(self, num_classes: int, rho: float = 1.0):
-        self.num_classes = num_classes
-        self.rho = rho
-        self.per_class = [
-            {
-                'protos': torch.empty(0, 64),
-                'seen': 0,
-                'radius': 0.0
-            } for _ in range(num_classes)
-        ]
-
-    def should_keep(self, z_norm: torch.Tensor, y: int) -> bool:
-        st = self.per_class[y]
-        st['seen'] += 1
-        quota = int(max(1, round(self.rho * math.log(max(2, st['seen'])))))
-        P = st['protos'].size(0)
-        if P < quota:
-            self._add_proto(y, z_norm)
-            return True
-        # compute distances on CPU to match stored prototypes' device
-        z_cpu = z_norm.detach().cpu().view(1, -1)
-        d2 = torch.cdist(z_cpu, st['protos']).squeeze(0)
-        min_d = float(d2.min().item()) if d2.numel() > 0 else float('inf')
-        if min_d > st['radius']:
-            idx = int(d2.argmin().item()) if d2.numel() > 0 else 0
-            with torch.no_grad():
-                st['protos'][idx] = z_cpu.squeeze(0)
-            st['radius'] = running_mean(st['radius'], min_d, P + 1)
+    def maybe_grow(self, val_mse_threshold: float, sketch_z: torch.Tensor) -> bool:
+        if self.latest_moving_mse > val_mse_threshold:
+            self.add_generation(sketch_z)
             return True
         return False
 
-    def _add_proto(self, y: int, z_norm: torch.Tensor):
-        st = self.per_class[y]
-        zn = z_norm.detach().cpu().view(1, -1)
-        if st['protos'].numel() == 0:
-            st['protos'] = zn
-            st['radius'] = 0.0
-        else:
-            st['protos'] = torch.cat([st['protos'], zn], dim=0)
-            if st['protos'].size(0) > 1:
-                d = torch.cdist(st['protos'], st['protos'])
-                d[d == 0] = d.max()
-                st['radius'] = float(d.min(dim=1).values.mean().item())
+    def memory_bytes_codebooks(self) -> int:
+        total = 0
+        for cb in self.generations:
+            M, K, d = cb.shape
+            total += int(M * K * d * 4)
+        return total
 
 
-# ------------------------------
-# Episodic Memory Manager
-# ------------------------------
-
-@dataclass
-class MemoryItem:
-    codes: torch.ByteTensor  # [M]
-    label: int               # uint8 range recommended
-    gen_id: int              # generation id used to encode
-
+# -----------------------------
+# Episodic Memory with GIS-like selection
+# -----------------------------
 
 class EpisodicMemory:
-    def __init__(self, cap_bytes: int, M: int, include_gen_id: bool = True):
-        self.cap_bytes = cap_bytes
-        self.items: List[MemoryItem] = []
-        self.M = M
-        self.include_gen_id = include_gen_id
-        self.bytes_used = 0
+    def __init__(self, pq: ProductQuantizer, item_bytes: int, cap_bytes: int, rho: int = 8,
+                 sampler: str = "uniform", device: str = "cpu"):
+        self.pq = pq
+        self.item_bytes = int(item_bytes)
+        self.cap_bytes = int(cap_bytes)
+        self.rho = rho
+        self.sampler = sampler
+        self.device = device
+        self.codes: List[torch.Tensor] = []
+        self.labels: List[torch.Tensor] = []
+        self.gens: List[torch.Tensor] = []
+        self.inserted = 0
 
-    def _bytes_per_item(self) -> int:
-        return self.M + 1 + (1 if self.include_gen_id else 0)
+    def total_items(self) -> int:
+        return int(sum(c.size(0) for c in self.codes))
 
-    def can_add(self) -> bool:
-        return (self.bytes_used + self._bytes_per_item()) <= self.cap_bytes
+    def as_tensors(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if len(self.codes) == 0:
+            return (torch.empty(0, self.pq.M, dtype=torch.long, device=self.device),
+                    torch.empty(0, dtype=torch.long, device=self.device),
+                    torch.empty(0, dtype=torch.long, device=self.device))
+        return (torch.cat(self.codes, dim=0), torch.cat(self.labels, dim=0), torch.cat(self.gens, dim=0))
 
-    def add(self, codes: torch.ByteTensor, label: int, gen_id: int):
-        if not self.can_add():
-            return False
-        self.items.append(MemoryItem(codes.cpu().clone().view(-1), int(label), int(gen_id)))
-        self.bytes_used += self._bytes_per_item()
-        return True
+    def memory_bytes(self) -> int:
+        codebooks_bytes = self.pq.memory_bytes_codebooks()
+        num_items = self.total_items()
+        return int(num_items * self.item_bytes + codebooks_bytes)
 
-    def sample(self, K: int, device: torch.device) -> Tuple[torch.ByteTensor, torch.LongTensor, torch.LongTensor]:
-        if len(self.items) == 0 or K <= 0:
-            return torch.empty(0, self.M, dtype=torch.uint8, device=device), \
-                   torch.empty(0, dtype=torch.long, device=device), \
-                   torch.empty(0, dtype=torch.long, device=device)
-        idx = np.random.choice(len(self.items), size=min(K, len(self.items)), replace=False)
-        codes = torch.stack([self.items[i].codes for i in idx])
-        labels = torch.tensor([self.items[i].label for i in idx], dtype=torch.long)
-        gens = torch.tensor([self.items[i].gen_id for i in idx], dtype=torch.long)
-        return codes.to(device), labels.to(device), gens.to(device)
+    def _per_class_indices(self, y: torch.Tensor) -> Dict[int, torch.Tensor]:
+        out: Dict[int, torch.Tensor] = {}
+        for cls in y.unique().tolist():
+            idx = (y == cls).nonzero(as_tuple=False).flatten()
+            out[int(cls)] = idx
+        return out
+
+    def _farthest_first_select(self, z_norm: torch.Tensor, k: int) -> torch.Tensor:
+        N = z_norm.size(0)
+        if k >= N:
+            return torch.arange(N, device=z_norm.device)
+        sel = [0]
+        dist = 1 - (z_norm @ z_norm[sel[0]].unsqueeze(0).T).squeeze(1)
+        for _ in range(1, k):
+            idx = torch.argmax(dist).item()
+            sel.append(idx)
+            dist = torch.minimum(dist, 1 - (z_norm @ z_norm[idx].unsqueeze(0).T).squeeze(1))
+        return torch.tensor(sel, device=z_norm.device, dtype=torch.long)
+
+    def _enforce_cap_with_gis(self):
+        codebooks_bytes = self.pq.memory_bytes_codebooks()
+        avail_bytes = max(0, self.cap_bytes - codebooks_bytes)
+        max_items = avail_bytes // self.item_bytes if self.item_bytes > 0 else 0
+        codes, labels, gens = self.as_tensors()
+        N = codes.size(0)
+        if N <= max_items:
+            return
+        with torch.no_grad():
+            z_hat = self.pq.decode(codes, gens)
+            z_norm = F.normalize(z_hat, dim=-1)
+        cls_indices = self._per_class_indices(labels)
+        selected_global = []
+        per_class_target: Dict[int, int] = {}
+        total_target = 0
+        for cls, idx in cls_indices.items():
+            Nc = idx.numel()
+            k = min(Nc, max(1, int(self.rho * math.log(Nc + math.e))))
+            per_class_target[cls] = k
+            total_target += k
+        if total_target > max_items and total_target > 0:
+            scale = max_items / total_target
+            for cls in per_class_target:
+                per_class_target[cls] = max(1, int(per_class_target[cls] * scale))
+        for cls, idx in cls_indices.items():
+            k = per_class_target[cls]
+            if idx.numel() <= k:
+                selected_global.append(idx)
+            else:
+                sel_local = self._farthest_first_select(z_norm[idx], k)
+                selected_global.append(idx[sel_local])
+        idx_keep = torch.cat(selected_global, dim=0)
+        self.codes = [codes[idx_keep]]
+        self.labels = [labels[idx_keep]]
+        self.gens = [gens[idx_keep]]
+
+    def insert(self, z: torch.Tensor, y: torch.Tensor):
+        codes, _, gens = self.pq.encode(z)
+        self.pq.ema_update_latest(z, codes)
+        self.inserted += z.size(0)
+        self.codes.append(codes.detach().to(self.device))
+        self.labels.append(y.detach().to(self.device).long())
+        self.gens.append(gens.detach().to(self.device))
+        self._enforce_cap_with_gis()
+
+    def sample(self, K: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        codes, labels, gens = self.as_tensors()
+        N = codes.size(0)
+        if N == 0 or K <= 0:
+            return (torch.empty(0, self.pq.z_dim, device=self.device),
+                    torch.empty(0, dtype=torch.long, device=self.device),
+                    torch.empty(0, self.pq.M, dtype=torch.long, device=self.device))
+        if self.sampler == "class":
+            per_class = self._per_class_indices(labels)
+            take = []
+            per = max(1, K // max(1, len(per_class)))
+            for _, idx in per_class.items():
+                if idx.numel() <= per:
+                    take.append(idx)
+                else:
+                    perm = torch.randperm(idx.numel(), device=idx.device)[:per]
+                    take.append(idx[perm])
+            idx = torch.cat(take, dim=0)
+            if idx.numel() > K:
+                idx = idx[torch.randperm(idx.numel(), device=idx.device)[:K]]
+        else:
+            idx = torch.randperm(N, device=codes.device)[:min(K, N)]
+        codes_s = codes[idx]
+        labels_s = labels[idx]
+        gens_s = gens[idx]
+        z_hat = self.pq.decode(codes_s, gens_s)
+        return z_hat, labels_s, codes_s
 
 
-# ------------------------------
-# Budget Controller
-# ------------------------------
-
-class BudgetController:
-    def __init__(self, C_per_task: int = 400):
-        self.C = C_per_task
-        self.remaining = C_per_task
-
-    def begin_task(self, C_per_task: Optional[int] = None):
-        self.C = self.C if C_per_task is None else C_per_task
-        self.remaining = self.C
-
-    def decide_K(self, requested_K: int) -> int:
-        if self.remaining <= 0:
-            return 0
-        if self.remaining < 10:
-            return max(0, min(requested_K, 8))
-        return requested_K
-
-    def register_backprop(self, units: int = 1):
-        self.remaining = max(0, self.remaining - units)
-
-
-# ------------------------------
-# Training/Evaluation Utilities
-# ------------------------------
+# -----------------------------
+# Training configs and learners
+# -----------------------------
 
 @dataclass
 class TrainConfig:
+    f_dim: int = 256
+    z_dim: int = 64
+    M: int = 8
+    d_sub: int = 8
+    K: int = 256
+    pq_alpha: float = 0.05
+    pq_tau: float = 0.07
+    mse_growth_thr: float = 0.07
+    rho: int = 8
     lr: float = 0.1
-    weight_decay: float = 5e-4
+    wd: float = 5e-4
     momentum: float = 0.9
-    epochs_per_task: int = 1
-    warmup_epochs_first_task: int = 1
-    freeze_after_warmup: bool = True
-    tau_recon: float = 0.1
-    rho_gis: float = 1.0
+    batch_size: int = 64
+    epochs_warmup_task1: int = 1
+    C_backprops_per_task: int = 400
     replay_K: int = 64
-    budget_C: int = 400
+    replay_sampler: str = "uniform"
+    lam_l2: float = 1.0
+    lam_cos: float = 0.2
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
     mem_cap_mb: float = 5.0
+    no_gis: bool = False
+    no_curriculum: bool = False
+    no_f_space_loss: bool = False
 
 
-@dataclass
-class RunStats:
-    acc_per_task: List[float] = field(default_factory=list)
-    forget_per_task: List[float] = field(default_factory=list)
-    memory_mb_per_task: List[float] = field(default_factory=list)
-    loss_curve: List[float] = field(default_factory=list)
-    gen_count_per_task: List[int] = field(default_factory=list)
+class ProPqEMLearner:
+    def __init__(self, num_classes: int, cfg: TrainConfig):
+        self.cfg = cfg
+        self.device = cfg.device
+        self.backbone = TinyBackbone(out_dim=cfg.f_dim).to(self.device)
+        self.res_enc = ResidualEncoder(in_dim=cfg.f_dim, out_dim=cfg.z_dim).to(self.device)
+        self.delta_dec = DeltaDecoder(in_dim=cfg.z_dim, out_dim=cfg.f_dim).to(self.device)
+        self.clf = ClassifierHead(in_dim=cfg.f_dim, num_classes=num_classes).to(self.device)
 
+        assert cfg.M * cfg.d_sub == cfg.z_dim
+        self.pq = ProductQuantizer(M=cfg.M, d_sub=cfg.d_sub, K=cfg.K, alpha=cfg.pq_alpha, tau=cfg.pq_tau, device=self.device)
+        item_bytes = cfg.M + 2  # M byte indices + label + gen
+        self.memory = EpisodicMemory(self.pq, item_bytes=item_bytes, cap_bytes=int(cfg.mem_cap_mb * 1024 * 1024),
+                                     rho=cfg.rho, sampler=cfg.replay_sampler, device=self.device)
+        params = list(self.backbone.parameters()) + list(self.res_enc.parameters()) + list(self.delta_dec.parameters()) + list(self.clf.parameters())
+        self.opt = torch.optim.SGD([p for p in params if p.requires_grad], lr=cfg.lr, momentum=cfg.momentum, weight_decay=cfg.wd)
+        self.backprops = 0
+        self.task_id = 0
+        self.history = {"task": [], "acc": [], "fg": [], "mem_bytes": [], "pq_mse": [], "gens": [], "flops_fw": [], "backprops": []}
 
-def _ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+    def _compute_flops(self, x_img: torch.Tensor, f_replay: torch.Tensor) -> float:
+        if not _FLOPS_OK:
+            return float('nan')
+        try:
+            fwd = FlopCountAnalysis(nn.Sequential(self.backbone, self.clf), x_img)
+            flops_img = float(fwd.total())
+        except Exception:
+            flops_img = float('nan')
+        try:
+            fwd2 = FlopCountAnalysis(self.clf, f_replay)
+            flops_replay = float(fwd2.total())
+        except Exception:
+            flops_replay = float('nan')
+        val = (flops_img if not math.isnan(flops_img) else 0.0) + (flops_replay if not math.isnan(flops_replay) else 0.0)
+        return val
 
+    def warm_start_pq(self, loader: DataLoader, sketch_size: int = 2048):
+        self.backbone.eval()
+        self.res_enc.eval()
+        feats = []
+        with torch.no_grad():
+            for x, _ in loader:
+                x = x.to(self.device)
+                f = self.backbone(x)
+                z = self.res_enc(f)
+                feats.append(z.detach().cpu())
+                if len(torch.cat(feats)) >= sketch_size:
+                    break
+        if len(feats) == 0:
+            raise RuntimeError("Warm start loader produced no data")
+        Z = torch.cat(feats)[:sketch_size].to(self.device)
+        self.pq.warm_start(Z)
 
-def _save_plot(fig_path: str):
-    plt.tight_layout()
-    plt.savefig(fig_path, bbox_inches='tight')
-    plt.close()
+    def train_task(self, train_loader: DataLoader, class_ids: List[int], warmup: bool = False):
+        cfg = self.cfg
+        self.backprops = 0
+        self.task_id += 1
+        device = self.device
+        self.backbone.train(); self.res_enc.train(); self.delta_dec.train(); self.clf.train()
 
-
-def train_propqem(task_stream, num_classes: int, cfg: TrainConfig, device: torch.device, seed: int = 0,
-                  save_dir: str = '.research/iteration2/images', verbose: bool = True) -> RunStats:
-    set_seed(seed)
-    _ensure_dir(save_dir)
-
-    backbone = TinyConvBackbone(out_dim=256).to(device)
-    residual = ResidualMLP(in_dim=256, hidden=128, out_dim=64).to(device)
-    decoder = DeltaDecoder(in_dim=64, hidden=128, out_dim=256).to(device)
-    classifier = Classifier(in_dim=256, num_classes=num_classes).to(device)
-
-    params = list(residual.parameters()) + list(decoder.parameters()) + list(classifier.parameters())
-    params += [p for p in backbone.parameters() if p.requires_grad]
-    opt = torch.optim.SGD(params, lr=cfg.lr, momentum=cfg.momentum, weight_decay=cfg.weight_decay)
-
-    pq = ProductQuantiser(D=64, M=8, Ks=256, device=device).to(device)
-    gis = GISState(num_classes=num_classes, rho=cfg.rho_gis)
-
-    mem_cap_bytes = int(cfg.mem_cap_mb * 1024 * 1024)
-    memory = EpisodicMemory(cap_bytes=mem_cap_bytes, M=pq.M, include_gen_id=True)
-
-    budget = BudgetController(C_per_task=cfg.budget_C)
-
-    stats = RunStats()
-    acc_matrix: List[List[float]] = []
-
-    global_step = 0
-    for task_id, train_loader, val_loader, test_loader, cls in task_stream:
-        if verbose:
-            print(f"\n===== Task {task_id} | Classes: {cls} =====")
-        budget.begin_task(cfg.budget_C)
-        is_first_task = (task_id == 0)
-
-        total_epochs = cfg.epochs_per_task + (cfg.warmup_epochs_first_task if is_first_task else 0)
-        for epoch in range(total_epochs):
-            backbone.train(); residual.train(); decoder.train(); classifier.train()
-            epoch_loss = 0.0
-            for xb, yb in train_loader:
-                xb = to_device(xb, device)
-                yb = to_device(yb, device)
-
-                f = backbone(xb)
-                z = residual(f)
-
-                with torch.no_grad():
-                    codes = pq.encode(z.detach())
-                kept = 0
-                for i in range(z.size(0)):
-                    z_norm = F.normalize(z[i], dim=0)
-                    label_i = int(yb[i].item())
-                    if gis.should_keep(z_norm, label_i):
-                        if memory.can_add():
-                            ok = memory.add(codes[i].detach().cpu(), label_i, pq.current_generation_id())
-                            if ok:
-                                kept += 1
-
-                # Replay under budget
-                K = budget.decide_K(cfg.replay_K)
-                mem_codes, mem_labels, mem_gens = memory.sample(K, device)
-                if mem_codes.size(0) > 0:
-                    z_replay = pq.decode_mixed_gens(mem_codes, mem_gens)
-                    f_recon = decoder(z_replay)
-                    logits_rep = classifier(f_recon)
-                    loss_replay = F.cross_entropy(logits_rep, mem_labels)
-                else:
-                    loss_replay = torch.tensor(0.0, device=device)
-
-                logits_cur = classifier(f)
-                loss_cls = F.cross_entropy(logits_cur, yb)
-
-                with torch.no_grad():
-                    codes_tmp = pq.encode(z.detach())
-                    z_pq = pq.decode(codes_tmp, pq.current_generation_id())
-                loss_geom = cosine_error(z, z_pq).mean()
-
-                loss = loss_cls + 0.5 * loss_replay + 0.1 * loss_geom
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                opt.step()
-
-                epoch_loss += float(loss.item())
-                budget.register_backprop(1)
-                global_step += 1
-
-            epoch_loss /= max(1, len(train_loader))
-            stats.loss_curve.append(epoch_loss)
-            if verbose:
-                print(f"Task {task_id} Epoch {epoch} | loss={epoch_loss:.4f} | kept={kept} | mem={bytes_to_mb(memory.bytes_used):.3f} MB | gen={pq.generation_count()}")
-
-            if is_first_task and cfg.freeze_after_warmup and epoch + 1 == cfg.warmup_epochs_first_task:
-                if verbose:
-                    print("Freezing bottom-3 blocks of backbone after warm-up.")
-                backbone.freeze_low_blocks()
-
-            # Curriculum codebook growth check
-            with torch.no_grad():
-                z_list = []
-                for xv, _ in val_loader:
-                    xv = to_device(xv, device)
-                    f_val = backbone(xv)
-                    z_val = residual(f_val)
-                    z_list.append(z_val)
-                    if len(z_list) * val_loader.batch_size >= 256:
+        if warmup and self.task_id == 1:
+            print("[Train] Warmup epoch for task-1 (unfrozen backbone)")
+            for _ in range(cfg.epochs_warmup_task1):
+                for x, y in train_loader:
+                    if self.backprops >= cfg.C_backprops_per_task:
                         break
-                if len(z_list) > 0:
-                    z_sketch = torch.cat(z_list, dim=0)
-                    recon_err = pq.recon_error(z_sketch).item()
-                    if verbose:
-                        print(f"Validation PQ recon error (cosine): {recon_err:.4f}")
-                    if recon_err > cfg.tau_recon:
-                        if verbose:
-                            print("Recon error exceeds tau; adding new PQ generation.")
-                        pq.add_new_generation(init_means=z_sketch.detach())
+                    x, y = x.to(device), y.to(device)
+                    f = self.backbone(x)
+                    z = self.res_enc(f)
+                    codes, z_rec, _ = self.pq.encode(z)
+                    f_hat = self.delta_dec(z_rec)
+                    logits_cur = self.clf(f)
+                    loss_ce = F.cross_entropy(logits_cur, y)
+                    loss_rec = 0.0
+                    if not cfg.no_f_space_loss:
+                        loss_rec = cfg.lam_l2 * F.mse_loss(f_hat, f) + cfg.lam_cos * (1 - cosine_sim(f_hat, f).mean())
+                    loss = loss_ce + loss_rec
+                    self.opt.zero_grad(); loss.backward(); self.opt.step()
+                    self.pq.ema_update_latest(z, codes)
+                    self.pq.revive_dead_codes_latest(z_pool=z)
+                    self.backprops += 1
+                    if self.backprops >= cfg.C_backprops_per_task:
+                        break
+            self.backbone.freeze_low()
 
-        # Evaluate on all seen tasks so far
-        acc_this_task = []
-        for _, _, _, test_loader_j, _ in task_stream[:task_id+1]:
-            acc_j, _, _ = evaluate(backbone, classifier, test_loader_j, device, num_classes)
-            acc_this_task.append(acc_j)
-        acc_matrix.append(acc_this_task)
+        for x, y in train_loader:
+            if self.backprops >= cfg.C_backprops_per_task:
+                break
+            x, y = x.to(device), y.to(device)
+            f = self.backbone(x)
+            z = self.res_enc(f)
+            codes, z_rec, _ = self.pq.encode(z)
+            f_hat_cur = self.delta_dec(z_rec)
 
-        acc_current_task = acc_this_task[-1] if len(acc_this_task) else 0.0
-        stats.acc_per_task.append(acc_current_task)
-        fgt_list = compute_forgetting(acc_matrix)
-        avg_fgt = float(np.mean(fgt_list)) if len(fgt_list) else 0.0
-        stats.forget_per_task.append(avg_fgt)
-        total_bytes = memory.bytes_used + pq.bytes_for_codebooks()
-        stats.memory_mb_per_task.append(bytes_to_mb(total_bytes))
-        stats.gen_count_per_task.append(pq.generation_count())
-        if verbose:
-            print(f"After Task {task_id}: ACC={acc_current_task*100:.2f}% | AvgFGT={avg_fgt*100:.2f}% | Memory={bytes_to_mb(total_bytes):.3f} MB | Generations={pq.generation_count()}")
+            z_rep, y_rep, _ = self.memory.sample(cfg.replay_K)
+            f_rep = torch.empty(0, cfg.f_dim, device=device)
+            if z_rep.numel() > 0:
+                f_rep = self.delta_dec(z_rep)
 
-    # Final confusion matrix on last task
-    last_test_loader = task_stream[-1][3]
-    acc_last, preds, gts = evaluate(backbone, classifier, last_test_loader, device, num_classes)
-    cm = compute_confusion_matrix(preds, gts, num_classes)
+            _ = self._compute_flops(x, f_rep)  # not stored per step to keep runtime low
 
-    # Plots
-    plt.figure(figsize=(5,3))
-    plt.plot(stats.loss_curve, label='train_loss')
-    plt.xlabel('Epochs (cumulative)')
-    plt.ylabel('Loss')
-    plt.title('Training Loss (ProPqEM)')
-    plt.legend()
-    _save_plot(os.path.join(save_dir, 'training_loss_propqem.pdf'))
+            logits_cur = self.clf(f)
+            loss_ce = F.cross_entropy(logits_cur, y)
+            loss_rep = 0.0
+            if f_rep.numel() > 0:
+                logits_rep = self.clf(f_rep)
+                loss_rep = F.cross_entropy(logits_rep, y_rep)
+            loss_rec = 0.0
+            if not cfg.no_f_space_loss:
+                loss_rec = cfg.lam_l2 * F.mse_loss(f_hat_cur, f) + cfg.lam_cos * (1 - cosine_sim(f_hat_cur, f).mean())
+            loss = loss_ce + loss_rep + loss_rec
 
-    plt.figure(figsize=(5,3))
-    plt.plot(list(range(len(stats.acc_per_task))), stats.acc_per_task, marker='o')
-    plt.xlabel('Task')
-    plt.ylabel('ACC (current task)')
-    plt.title('Accuracy per Task (ProPqEM)')
-    _save_plot(os.path.join(save_dir, 'accuracy_propqem.pdf'))
+            self.opt.zero_grad(); loss.backward(); self.opt.step()
+            self.backprops += 1
 
-    plt.figure(figsize=(5,3))
-    plt.plot(stats.memory_mb_per_task, marker='s')
-    plt.xlabel('Task')
-    plt.ylabel('Memory (MB)')
-    plt.title('Memory Footprint (ProPqEM)')
-    _save_plot(os.path.join(save_dir, 'memory_footprint_propqem.pdf'))
+            self.pq.ema_update_latest(z, codes)
+            self.pq.revive_dead_codes_latest(z_pool=z)
 
-    plt.figure(figsize=(6,5))
-    cm_disp = np.log1p(cm)
-    sns.heatmap(cm_disp, cmap='viridis')
-    plt.title('Confusion Matrix (log1p) – ProPqEM')
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    _save_plot(os.path.join(save_dir, 'confusion_matrix_propqem.pdf'))
+            with torch.no_grad():
+                take = min(x.size(0) // 2, 16)
+                idx = torch.randperm(x.size(0), device=device)[:take]
+                self.memory.insert(z[idx], y[idx])
 
-    return stats
+            if not self.cfg.no_curriculum:
+                self.pq.maybe_grow(cfg.mse_growth_thr, z.detach())
+
+            if self.backprops % 50 == 0 or self.backprops == 1:
+                mem_bytes = self.memory.memory_bytes()
+                print(f"[Task {self.task_id}] step backprops={self.backprops} loss={loss.item():.4f} mem={mem_bytes/1e6:.3f}MB pq_mse_ma={self.pq.latest_moving_mse:.4f} gens={len(self.pq.generations)}")
+
+        # Update history placeholders; evaluation happens in src.evaluate
+        self.history["task"].append(self.task_id)
+        self.history["acc"].append(0.0)
+        self.history["fg"].append(0.0)
+        self.history["mem_bytes"].append(self.memory.memory_bytes())
+        self.history["pq_mse"].append(self.pq.latest_moving_mse)
+        self.history["gens"].append(len(self.pq.generations))
+        self.history["flops_fw"].append(0.0)
+        self.history["backprops"].append(self.backprops)
+
+    def get_memory_bytes(self) -> int:
+        return self.memory.memory_bytes()
 
 
-def train_baseline_raw_feature(task_stream, num_classes: int, cfg: TrainConfig, device: torch.device, seed: int = 0,
-                               save_dir: str = '.research/iteration2/images', verbose: bool = True) -> RunStats:
-    set_seed(seed)
-    _ensure_dir(save_dir)
+class ERFeatureLearner:
+    def __init__(self, num_classes: int, cfg: TrainConfig):
+        self.cfg = cfg
+        self.device = cfg.device
+        self.backbone = TinyBackbone(out_dim=cfg.f_dim).to(self.device)
+        self.clf = ClassifierHead(in_dim=cfg.f_dim, num_classes=num_classes).to(self.device)
+        self.opt = torch.optim.SGD(list(self.backbone.parameters()) + list(self.clf.parameters()), lr=cfg.lr, momentum=cfg.momentum, weight_decay=cfg.wd)
+        self.memory_f: List[torch.Tensor] = []
+        self.memory_y: List[torch.Tensor] = []
+        self.f_dim = cfg.f_dim
+        self.item_bytes = cfg.f_dim * 4 + 1
+        self.cap_bytes = int(cfg.mem_cap_mb * 1024 * 1024)
+        self.backprops = 0
+        self.task_id = 0
+        self.history = {"task": [], "acc": [], "fg": [], "mem_bytes": [], "gens": [], "flops_fw": [], "backprops": []}
 
-    backbone = TinyConvBackbone(out_dim=256).to(device)
-    classifier = Classifier(in_dim=256, num_classes=num_classes).to(device)
-    opt = torch.optim.SGD(list(backbone.parameters()) + list(classifier.parameters()), lr=cfg.lr, momentum=cfg.momentum, weight_decay=cfg.weight_decay)
+    def memory_bytes(self) -> int:
+        total = sum(x.numel() * 4 for x in self.memory_f)
+        total += sum(y.numel() for y in self.memory_y)
+        return int(total)
 
-    mem_cap_bytes = int(cfg.mem_cap_mb * 1024 * 1024)
-    stored_features: List[Tuple[torch.Tensor, int]] = []
-    bytes_used = 0
+    def _enforce_cap(self):
+        while self.memory_bytes() > self.cap_bytes and len(self.memory_f) > 0:
+            self.memory_f.pop(0)
+            self.memory_y.pop(0)
 
-    stats = RunStats()
-    acc_matrix: List[List[float]] = []
+    def sample(self, K: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if len(self.memory_f) == 0:
+            return torch.empty(0, self.f_dim, device=self.cfg.device), torch.empty(0, dtype=torch.long, device=self.cfg.device)
+        F = torch.cat(self.memory_f, dim=0)
+        Y = torch.cat(self.memory_y, dim=0)
+        N = F.size(0)
+        idx = torch.randperm(N, device=F.device)[:min(K, N)]
+        return F[idx], Y[idx]
 
-    for task_id, train_loader, _, test_loader, cls in task_stream:
-        if verbose:
-            print(f"\n[Baseline] Task {task_id} | Classes: {cls}")
-        for epoch in range(cfg.epochs_per_task):
-            backbone.train(); classifier.train()
-            epoch_loss = 0.0
-            for xb, yb in train_loader:
-                xb = to_device(xb, device)
-                yb = to_device(yb, device)
-                f = backbone(xb)
-                logits = classifier(f)
-                loss = F.cross_entropy(logits, yb)
+    def train_task(self, train_loader: DataLoader, class_ids: List[int], warmup: bool = False):
+        self.backprops = 0
+        self.task_id += 1
+        device = self.cfg.device
+        self.backbone.train(); self.clf.train()
+        if warmup and self.task_id == 1:
+            for _ in range(self.cfg.epochs_warmup_task1):
+                for x, y in train_loader:
+                    if self.backprops >= self.cfg.C_backprops_per_task:
+                        break
+                    x, y = x.to(device), y.to(device)
+                    f = self.backbone(x)
+                    logits = self.clf(f)
+                    loss = F.cross_entropy(logits, y)
+                    self.opt.zero_grad(); loss.backward(); self.opt.step()
+                    self.backprops += 1
+                    if self.backprops >= self.cfg.C_backprops_per_task:
+                        break
+            self.backbone.freeze_low()
+        for x, y in train_loader:
+            if self.backprops >= self.cfg.C_backprops_per_task:
+                break
+            x, y = x.to(device), y.to(device)
+            f = self.backbone(x)
+            f_rep, y_rep = self.sample(self.cfg.replay_K)
+            logits = self.clf(f)
+            loss = F.cross_entropy(logits, y)
+            if f_rep.numel() > 0:
+                logits_rep = self.clf(f_rep)
+                loss = loss + F.cross_entropy(logits_rep, y_rep)
+            self.opt.zero_grad(); loss.backward(); self.opt.step()
+            self.backprops += 1
+            with torch.no_grad():
+                take = min(x.size(0) // 2, 16)
+                idx = torch.randperm(x.size(0), device=device)[:take]
+                self.memory_f.append(f[idx].detach())
+                self.memory_y.append(y[idx].detach())
+                self._enforce_cap()
 
-                if len(stored_features) > 0:
-                    idx = np.random.choice(len(stored_features), size=min(cfg.replay_K, len(stored_features)), replace=False)
-                    f_rep = torch.stack([stored_features[i][0] for i in idx]).to(device)
-                    y_rep = torch.tensor([stored_features[i][1] for i in idx], dtype=torch.long, device=device)
-                    logits_rep = classifier(f_rep)
-                    loss = loss + 0.5 * F.cross_entropy(logits_rep, y_rep)
-
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                opt.step()
-
-                epoch_loss += float(loss.item())
-
-                # Store some features under memory cap (float32)
-                f_det = f.detach().cpu()
-                for i in range(f_det.size(0)):
-                    item_bytes = count_bytes_tensor(f_det[i]) + 1
-                    if bytes_used + item_bytes <= mem_cap_bytes:
-                        stored_features.append((f_det[i].clone(), int(yb[i].item())))
-                        bytes_used += item_bytes
-
-            epoch_loss /= max(1, len(train_loader))
-            stats.loss_curve.append(epoch_loss)
-            if verbose:
-                print(f"[Baseline] Task {task_id} Epoch {epoch} | loss={epoch_loss:.4f} | mem={bytes_to_mb(bytes_used):.3f} MB")
-
-        # Eval on seen tasks
-        acc_this_task = []
-        for _, _, _, test_loader_j, _ in task_stream[:task_id+1]:
-            acc_j, _, _ = evaluate(backbone, classifier, test_loader_j, device, num_classes)
-            acc_this_task.append(acc_j)
-        acc_matrix.append(acc_this_task)
-
-        acc_current_task = acc_this_task[-1] if len(acc_this_task) else 0.0
-        stats.acc_per_task.append(acc_current_task)
-        fgt_list = compute_forgetting(acc_matrix)
-        avg_fgt = float(np.mean(fgt_list)) if len(fgt_list) else 0.0
-        stats.forget_per_task.append(avg_fgt)
-        stats.memory_mb_per_task.append(bytes_to_mb(bytes_used))
-        if verbose:
-            print(f"[Baseline] After Task {task_id}: ACC={acc_current_task*100:.2f}% | AvgFGT={avg_fgt*100:.2f}% | Memory={bytes_to_mb(bytes_used):.3f} MB")
-
-    # Plots
-    plt.figure(figsize=(5,3))
-    plt.plot(stats.loss_curve, label='train_loss')
-    plt.xlabel('Epochs (cumulative)')
-    plt.ylabel('Loss')
-    plt.title('Training Loss (Baseline Raw-Feature ER)')
-    plt.legend()
-    _save_plot(os.path.join(save_dir, 'training_loss_baseline.pdf'))
-
-    plt.figure(figsize=(5,3))
-    plt.plot(list(range(len(stats.acc_per_task))), stats.acc_per_task, marker='o')
-    plt.xlabel('Task')
-    plt.ylabel('ACC (current task)')
-    plt.title('Accuracy per Task (Baseline)')
-    _save_plot(os.path.join(save_dir, 'accuracy_baseline.pdf'))
-
-    plt.figure(figsize=(5,3))
-    plt.plot(stats.memory_mb_per_task, marker='s')
-    plt.xlabel('Task')
-    plt.ylabel('Memory (MB)')
-    plt.title('Memory Footprint (Baseline)')
-    _save_plot(os.path.join(save_dir, 'memory_footprint_baseline.pdf'))
-
-    return stats
+        self.history["task"].append(self.task_id)
+        self.history["acc"].append(0.0)
+        self.history["fg"].append(0.0)
+        self.history["mem_bytes"].append(self.memory_bytes())
+        self.history["gens"].append(0)
+        self.history["flops_fw"].append(0.0)
+        self.history["backprops"].append(self.backprops)

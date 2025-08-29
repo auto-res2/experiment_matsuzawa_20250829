@@ -1,86 +1,64 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Evaluation utilities for ProPqEM experiments.
+Evaluation helpers: accuracy, forgetting, and privacy metrics.
 """
-from typing import Tuple
+from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 
-def to_device(x, device):
-    if isinstance(x, (list, tuple)):
-        return [to_device(xx, device) for xx in x]
-    return x.to(device)
-
-
-def compute_confusion_matrix(preds: np.ndarray, labels: np.ndarray, num_classes: int) -> np.ndarray:
-    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
-    for p, t in zip(preds, labels):
-        cm[t, p] += 1
-    return cm
-
-
-def evaluate(model_f, model_cls, loader, device: torch.device, num_classes: int) -> Tuple[float, np.ndarray, np.ndarray]:
-    model_f.eval(); model_cls.eval()
-    preds = []
-    gts = []
+def evaluate_acc_propqem(backbone: torch.nn.Module, head: torch.nn.Module, loader, device: str) -> float:
+    backbone.eval(); head.eval()
+    correct, total = 0, 0
     with torch.no_grad():
         for x, y in loader:
-            x = to_device(x, device)
-            y = to_device(y, device)
-            f = model_f(x)
-            logits = model_cls(f)
-            pred = torch.argmax(logits, dim=1)
-            preds.append(pred.cpu().numpy())
-            gts.append(y.cpu().numpy())
-    preds = np.concatenate(preds) if len(preds) else np.array([])
-    gts = np.concatenate(gts) if len(gts) else np.array([])
-    acc = float((preds == gts).mean()) if len(preds) else 0.0
-    return acc, preds, gts
+            x, y = x.to(device), y.to(device)
+            f = backbone(x)
+            logits = head(f)
+            pred = logits.argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total += y.numel()
+    return correct / max(1, total)
 
 
-def compute_forgetting(acc_matrix):
-    # acc_matrix[t][j]: accuracy on task j after training task t
-    T = len(acc_matrix)
-    fgt = []
-    for j in range(T):
-        best = max(acc_matrix[t][j] for t in range(j, T)) if j < T else 0.0
-        last = acc_matrix[-1][j] if j < len(acc_matrix[-1]) else 0.0
-        fgt.append(max(0.0, best - last))
-    return fgt
+def evaluate_acc_er(backbone: torch.nn.Module, head: torch.nn.Module, loader, device: str) -> float:
+    return evaluate_acc_propqem(backbone, head, loader, device)
 
 
-def roc_auc_from_scores(scores: np.ndarray, labels: np.ndarray) -> float:
-    # Scores: higher = more member-like; Labels: 1=member,0=non-member
-    order = np.argsort(scores)
-    scores_sorted = scores[order]
-    labels_sorted = labels[order]
-    P = labels.sum()
-    N = len(labels) - P
-    if P == 0 or N == 0:
-        return 0.5
-    tps = 0
-    fps = 0
-    prev_score = -np.inf
-    points = []
-    for i in range(len(scores_sorted)):
-        s = scores_sorted[i]
-        if s != prev_score:
-            tpr = tps / P if P > 0 else 0.0
-            fpr = fps / N if N > 0 else 0.0
-            points.append((fpr, tpr))
-            prev_score = s
-        if labels_sorted[i] == 1:
-            tps += 1
-        else:
-            fps += 1
-    tpr = tps / P
-    fpr = fps / N
-    points.append((fpr, tpr))
-    points = sorted(points, key=lambda x: x[0])
-    auc = 0.0
-    for i in range(1, len(points)):
-        x0, y0 = points[i - 1]
-        x1, y1 = points[i]
-        auc += (x1 - x0) * (y0 + y1) / 2.0
-    return float(max(0.0, min(1.0, auc)))
+def average_forgetting(acc_matrix: np.ndarray) -> float:
+    if acc_matrix.size == 0:
+        return 0.0
+    T = acc_matrix.shape[0]
+    K = acc_matrix.shape[1]
+    fgt = 0.0
+    for k in range(K):
+        max_past = np.max(acc_matrix[:T, k])
+        final = acc_matrix[T-1, k]
+        fgt += max(0.0, float(max_past - final))
+    return fgt / max(1, K)
+
+
+def privacy_auc_loss_threshold(model_head: torch.nn.Module,
+                               member_feats: torch.Tensor,
+                               non_member_feats: torch.Tensor,
+                               labels: torch.Tensor,
+                               device: str) -> float:
+    model_head.eval()
+    with torch.no_grad():
+        logits_m = model_head(member_feats.to(device))
+        logits_n = model_head(non_member_feats.to(device))
+        y_m = labels[:logits_m.size(0)].to(device)
+        y_n = labels[:logits_n.size(0)].to(device)
+        loss_m = F.cross_entropy(logits_m, y_m, reduction='none').detach().cpu().numpy()
+        loss_n = F.cross_entropy(logits_n, y_n, reduction='none').detach().cpu().numpy()
+    scores = np.concatenate([loss_m, loss_n], axis=0)
+    gt = np.concatenate([np.ones_like(loss_m), np.zeros_like(loss_n)], axis=0)
+    try:
+        from sklearn.metrics import roc_auc_score  # type: ignore
+        auc = float(roc_auc_score(gt, -scores))
+    except Exception:
+        pos = scores[:len(loss_m)]; neg = scores[len(loss_m):]
+        auc = float(np.mean(pos[:, None] < neg[None, :]))
+    return auc
