@@ -6,5 +6,82 @@
     "lifelong learning compression",
     "memory-constrained continual",
     "parameter isolation efficiency"
+  ],
+  "research_study_list": [
+    {
+      "title": "Graph-Based Continual Learning"
+    },
+    {
+      "title": "Contextual Transformation Networks for Online Continual Learning"
+    },
+    {
+      "title": "Look-ahead Meta Learning for Continual Learning"
+    },
+    {
+      "title": "Look-ahead Meta Learning for Continual Learning"
+    },
+    {
+      "title": "Continual Learning in Low-rank Orthogonal Subspaces"
+    },
+    {
+      "title": "Replay across Experiments: A Natural Extension of Off-Policy RL"
+    },
+    {
+      "title": "Replay Memory as An Empirical MDP: Combining Conservative Estimation with Experience Replay"
+    },
+    {
+      "title": "Sample-Efficient Reinforcement Learning by Breaking the Replay Ratio Barrier"
+    },
+    {
+      "title": "Sample-Efficient Reinforcement Learning by Breaking the Replay Ratio Barrier"
+    },
+    {
+      "title": "Improving Computational Efficiency in Visual Reinforcement Learning via Stored Embeddings"
+    },
+    {
+      "title": "Long Live the Lottery: The Existence of Winning Tickets in Lifelong Learning"
+    },
+    {
+      "title": "Lifelong Learning of Compositional Structures"
+    },
+    {
+      "title": "Online Learned Continual Compression with Adaptive Quantization Modules"
+    },
+    {
+      "title": "Continual Learning with Evolving Class Ontologies"
+    },
+    {
+      "title": "Towards Backward-Compatible Continual Learning of Image Compression"
+    },
+    {
+      "title": "Contextual Transformation Networks for Online Continual Learning"
+    },
+    {
+      "title": "Continual Learning in Low-rank Orthogonal Subspaces"
+    },
+    {
+      "title": "Computationally Budgeted Continual Learning: What Does Matter?"
+    },
+    {
+      "title": "Generative vs. Discriminative: Rethinking The Meta-Continual Learning"
+    },
+    {
+      "title": "Exploring Data Geometry for Continual Learning"
+    },
+    {
+      "title": "Black-Box Methods for Restoring Monotonicity"
+    },
+    {
+      "title": "Refined bounds for algorithm configuration: The knife-edge of dual class approximability"
+    },
+    {
+      "title": "Seeking Neural Nuggets: Knowledge Transfer in Large Language Models from a Parametric Perspective"
+    },
+    {
+      "title": "Scaling Multi-Agent Reinforcement Learning with Selective Parameter Sharing"
+    },
+    {
+      "title": "Accelerating ERM for data-driven algorithm design using output-sensitive techniques"
+    }
   ]
 }
