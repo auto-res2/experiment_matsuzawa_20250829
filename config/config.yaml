@@ -1,0 +1,33 @@
+# Minimal configuration for a quick smoke test that runs under a minute on CPU/GPU.
+mode: smoke
+save_dir: .research/iteration1/images
+
+# Data/task stream
+dataset_name: fake  # use 'cifar100' for real runs
+num_tasks: 2
+classes_per_task: 5
+limit_per_class: 50
+seed: 42
+# device: cuda  # optional; auto-selects if available
+
+# Training configs
+train_config_propqem:
+  lr: 0.05
+  weight_decay: 0.0005
+  momentum: 0.9
+  epochs_per_task: 1
+  warmup_epochs_first_task: 1
+  freeze_after_warmup: true
+  tau_recon: 0.2
+  rho_gis: 1.0
+  replay_K: 16
+  budget_C: 80
+  mem_cap_mb: 1.0
+
+train_config_baseline:
+  lr: 0.05
+  weight_decay: 0.0005
+  momentum: 0.9
+  epochs_per_task: 1
+  replay_K: 16
+  mem_cap_mb: 1.0
