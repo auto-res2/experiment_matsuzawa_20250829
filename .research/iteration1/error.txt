@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/main.py", line 202, in <module>
+    main()
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/main.py", line 184, in main
+    with open(args.config, 'r') as f:
+         ^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'config/propqem_smoke.yaml'
