@@ -1,0 +1,23 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/main.py", line 88, in <module>
+    main()
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/main.py", line 72, in main
+    run_experiment1_strict(cfg, IMG_DIR)
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/train.py", line 645, in run_experiment1_strict
+    fq.train_task(t, task_train_loaders[t], task_val_loaders[t])
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/train.py", line 525, in train_task
+    self.buffer.push(z, yb)
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/train.py", line 290, in push
+    codes = self.pq.encode(Z)
+            ^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/_tool/Python/3.11.13/x64/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/train.py", line 205, in encode
+    self._init_kmeans(Z)
+  File "/home/runner/work/experiment_matsuzawa_20250829/experiment_matsuzawa_20250829/src/train.py", line 198, in _init_kmeans
+    self.centroids[m] = C
+    ~~~~~~~~~~~~~~^^^
+RuntimeError: The expanded size of the tensor (256) must match the existing size (32) at non-singleton dimension 0.  Target sizes: [256, 16].  Tensor sizes: [32, 16]
