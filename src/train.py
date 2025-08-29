@@ -1,7 +1,7 @@
 """
 Training utilities and core ProPqEM implementation.
 Run from project root with: python -m src.main
-All plots saved as high-quality PDFs under .research/iteration1/images by default.
+All plots saved as high-quality PDFs under .research/iteration2/images by default.
 """
 import os
 import math
@@ -280,12 +280,14 @@ class GISState:
         if P < quota:
             self._add_proto(y, z_norm)
             return True
-        d2 = torch.cdist(z_norm.view(1, -1), st['protos']).squeeze(0)
+        # compute distances on CPU to match stored prototypes' device
+        z_cpu = z_norm.detach().cpu().view(1, -1)
+        d2 = torch.cdist(z_cpu, st['protos']).squeeze(0)
         min_d = float(d2.min().item()) if d2.numel() > 0 else float('inf')
         if min_d > st['radius']:
             idx = int(d2.argmin().item()) if d2.numel() > 0 else 0
             with torch.no_grad():
-                st['protos'][idx] = z_norm.detach().cpu()
+                st['protos'][idx] = z_cpu.squeeze(0)
             st['radius'] = running_mean(st['radius'], min_d, P + 1)
             return True
         return False
@@ -411,7 +413,7 @@ def _save_plot(fig_path: str):
 
 
 def train_propqem(task_stream, num_classes: int, cfg: TrainConfig, device: torch.device, seed: int = 0,
-                  save_dir: str = '.research/iteration1/images', verbose: bool = True) -> RunStats:
+                  save_dir: str = '.research/iteration2/images', verbose: bool = True) -> RunStats:
     set_seed(seed)
     _ensure_dir(save_dir)
 
@@ -581,7 +583,7 @@ def train_propqem(task_stream, num_classes: int, cfg: TrainConfig, device: torch
 
 
 def train_baseline_raw_feature(task_stream, num_classes: int, cfg: TrainConfig, device: torch.device, seed: int = 0,
-                               save_dir: str = '.research/iteration1/images', verbose: bool = True) -> RunStats:
+                               save_dir: str = '.research/iteration2/images', verbose: bool = True) -> RunStats:
     set_seed(seed)
     _ensure_dir(save_dir)
 

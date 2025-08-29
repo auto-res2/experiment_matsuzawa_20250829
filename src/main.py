@@ -1,7 +1,7 @@
 """
 Main entry point. Run experiments with:
-  python -m src.main --config config/propqem_smoke.yaml
-Default runs a quick smoke test on FakeData and saves PDFs under .research/iteration1/images.
+  python -m src.main --config config/config.yaml
+Default runs a quick smoke test on FakeData and saves PDFs under .research/iteration2/images.
 """
 import os
 import argparse
@@ -20,7 +20,7 @@ from .evaluate import roc_auc_from_scores
 
 def run_smoke(cfg: dict):
     device = torch.device(cfg.get('device') or ('cuda' if torch.cuda.is_available() else 'cpu'))
-    save_dir = cfg.get('save_dir', '.research/iteration1/images')
+    save_dir = cfg.get('save_dir', '.research/iteration2/images')
     os.makedirs(save_dir, exist_ok=True)
 
     dataset_name = cfg.get('dataset_name', 'fake')
@@ -67,7 +67,7 @@ def run_smoke(cfg: dict):
 
 def run_experiment1(cfg: dict):
     device = torch.device(cfg.get('device') or ('cuda' if torch.cuda.is_available() else 'cpu'))
-    save_dir = cfg.get('save_dir', '.research/iteration1/images')
+    save_dir = cfg.get('save_dir', '.research/iteration2/images')
     os.makedirs(save_dir, exist_ok=True)
 
     dataset_name = cfg.get('dataset_name', 'cifar100')
@@ -115,7 +115,7 @@ def run_experiment1(cfg: dict):
 
 def run_experiment2(cfg: dict):
     device = torch.device(cfg.get('device') or ('cuda' if torch.cuda.is_available() else 'cpu'))
-    save_dir = cfg.get('save_dir', '.research/iteration1/images')
+    save_dir = cfg.get('save_dir', '.research/iteration2/images')
     os.makedirs(save_dir, exist_ok=True)
 
     dataset_name = cfg.get('dataset_name', 'cifar100')
@@ -154,7 +154,7 @@ def run_experiment2(cfg: dict):
 def run_experiment3(cfg: dict):
     # Privacy and compute-budget sensitivity (lightweight version)
     device = torch.device(cfg.get('device') or ('cuda' if torch.cuda.is_available() else 'cpu'))
-    save_dir = cfg.get('save_dir', '.research/iteration1/images')
+    save_dir = cfg.get('save_dir', '.research/iteration2/images')
     os.makedirs(save_dir, exist_ok=True)
 
     dataset_name = cfg.get('dataset_name', 'cifar100')
@@ -178,11 +178,15 @@ def run_experiment3(cfg: dict):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='config/propqem_smoke.yaml', help='Path to YAML config')
+    parser.add_argument('--config', type=str, default='config/config.yaml', help='Path to YAML config')
     args = parser.parse_args()
 
-    with open(args.config, 'r') as f:
-        cfg = yaml.safe_load(f)
+    if not os.path.exists(args.config):
+        # Fallback to defaults if config file missing
+        cfg = {}
+    else:
+        with open(args.config, 'r') as f:
+            cfg = yaml.safe_load(f)
 
     mode = cfg.get('mode', 'smoke').lower()
 

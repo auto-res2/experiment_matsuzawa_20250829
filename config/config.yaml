@@ -1,6 +1,6 @@
 # Minimal configuration for a quick smoke test that runs under a minute on CPU/GPU.
 mode: smoke
-save_dir: .research/iteration1/images
+save_dir: .research/iteration2/images
 
 # Data/task stream
 dataset_name: fake  # use 'cifar100' for real runs
